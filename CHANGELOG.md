@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- EVTX input: events are streamed record by record and evaluated in batches of 8192 as they arrive, instead of loading each whole file and evaluating on a 30 s timer. Parsing and evaluation overlap and memory stays bounded. In one-shot mode a "cycle" is now one batch, which is what `--max-runs` counts.
+
 ## [0.6.4] - 2026-11-08
 
 ### Changed

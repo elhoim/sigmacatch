@@ -536,6 +536,11 @@ impl DetectionEngine {
         self.events.push(event);
     }
 
+    /// Number of events waiting in the FIFO.
+    pub fn pending_events(&self) -> usize {
+        self.events.len()
+    }
+
     /// Drain the pending events FIFO.
     pub fn get_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)

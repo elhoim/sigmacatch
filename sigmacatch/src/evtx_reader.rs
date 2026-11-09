@@ -110,6 +110,54 @@ fn strip_record_id(event: &mut Event) {
     event.event_json = Arc::new(json);
 }
 
+/// Why streaming one EVTX file stopped early.
+enum StreamError {
+    /// The file could not be read or decoded: skip it, keep the others.
+    File(EvtxError),
+    /// The receiving side is gone: stop the whole producer.
+    ReceiverDropped,
+}
+
+impl EventCollector {
+    /// Parse `path` record by record and send each event as soon as it is
+    /// built, so the engine can evaluate while the rest of the file is still
+    /// being parsed and only a bounded number of events is in flight.
+    ///
+    /// Runs on a blocking thread: sending blocks while the channel is full.
+    fn stream_evtx(
+        path: &Path,
+        tx: &mpsc::Sender<Event>,
+        stop: &watch::Receiver<bool>,
+    ) -> std::result::Result<(), StreamError> {
+        let mut parser = evtx::EvtxParser::from_path(path).map_err(|e| {
+            StreamError::File(EvtxError::Parse(format!(
+                "Failed to open EVTX {}: {e}",
+                path.display()
+            )))
+        })?;
+        for record in parser.records() {
+            if *stop.borrow() {
+                break;
+            }
+            let record = record.map_err(|e| {
+                StreamError::File(EvtxError::Parse(format!(
+                    "EVTX record error in {}: {e}",
+                    path.display()
+                )))
+            })?;
+            let xml = std::str::from_utf8(record.data.as_bytes()).map_err(|_| {
+                StreamError::File(EvtxError::Parse("Invalid UTF-8 in EVTX record".to_string()))
+            })?;
+            let mut event = Event::from_xml_injected(xml, "windows", None)
+                .map_err(|e| StreamError::File(e.into()))?;
+            strip_record_id(&mut event);
+            tx.blocking_send(event)
+                .map_err(|_| StreamError::ReceiverDropped)?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl EventProducer for EventCollector {
     async fn run(
@@ -117,30 +165,34 @@ impl EventProducer for EventCollector {
         tx: mpsc::Sender<Event>,
         stop: watch::Receiver<bool>,
     ) -> std::result::Result<(), ProducerError> {
-        for path in &self.files {
-            if *stop.borrow() {
-                break;
-            }
-            let events = match Self::load_evtx(path) {
-                Ok(events) => events,
-                Err(e) => {
-                    warn!("Skipping EVTX {}: {e}", path.display());
-                    continue;
-                }
-            };
-            for mut event in events {
+        let files = self.files;
+        let streamed = tokio::task::spawn_blocking(move || {
+            for path in &files {
                 if *stop.borrow() {
                     break;
                 }
-                strip_record_id(&mut event);
-                tx.send(event).await.map_err(|_| {
-                    ProducerError::Collector(Box::new(EvtxError::Parse(
-                        "Channel send failed — receiver dropped".to_string(),
-                    )))
-                })?;
+                match Self::stream_evtx(path, &tx, &stop) {
+                    Ok(()) => {}
+                    Err(StreamError::File(e)) => {
+                        warn!("Skipping EVTX {}: {e}", path.display());
+                    }
+                    Err(StreamError::ReceiverDropped) => {
+                        return Err(EvtxError::Parse(
+                            "Channel send failed — receiver dropped".to_string(),
+                        ));
+                    }
+                }
             }
+            Ok(())
+        })
+        .await;
+        match streamed {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(ProducerError::Collector(Box::new(e))),
+            Err(join) => Err(ProducerError::Collector(Box::new(EvtxError::Parse(
+                format!("EVTX reader thread failed: {join}"),
+            )))),
         }
-        Ok(())
     }
 }
 

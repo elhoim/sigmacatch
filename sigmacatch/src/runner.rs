@@ -169,6 +169,9 @@ pub async fn bootstrap_repo_regression(
     Ok((sigma_repo, branch_name, regression))
 }
 
+/// One-shot inputs evaluate their events in batches of this many events.
+const ONE_SHOT_BATCH: usize = 8_192;
+
 /// Run the sigmacatch pipeline with the given collector.
 pub async fn run<C: CollectorKind>(kind: &C) -> Result<()> {
     let cli = parse_args();
@@ -470,14 +473,14 @@ pub async fn run_with_cli<C: CollectorKind>(
         }
     } else {
         // ── One-shot (e.g. EVTX file input): run until channel closes ─────
-        // Generate periodically to bound memory usage.
-        let mut one_shot_interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        one_shot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        one_shot_interval.tick().await; // skip immediate first tick
+        // Generate whenever a bounded batch of events is pending (instead of
+        // on a 30 s timer): the producer keeps parsing into the channel while a
+        // batch is evaluated, and memory stays bounded to a few batches.
         let mut one_shot_runs: u32 = 0;
         let mut dropped_while_generating = 0u64;
 
         loop {
+            let mut batch_due = false;
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     info!("Shutting down…");
@@ -488,6 +491,7 @@ pub async fn run_with_cli<C: CollectorKind>(
                         Some(event) => {
                             if let Some(pipeline) = pipeline_slot.as_mut() {
                                 pipeline.engine.put_event(event);
+                                batch_due = pipeline.engine.pending_events() >= ONE_SHOT_BATCH;
                             } else {
                                 dropped_while_generating += 1;
                                 if dropped_while_generating == 1 {
@@ -498,45 +502,50 @@ pub async fn run_with_cli<C: CollectorKind>(
                         None => break, // collector finished (channel closed)
                     }
                 }
-                _ = one_shot_interval.tick() => {
-                    let Some(taken) = pipeline_slot.take() else {
-                        continue;
-                    };
-                    match tokio::task::spawn_blocking(move || process_and_generate(taken)).await {
-                        Ok((returned, batches)) => {
-                            pipeline_slot = Some(returned);
-                            one_shot_runs += 1;
-                            info!("One-shot cycle {} completed", one_shot_runs);
+            }
+            if !batch_due {
+                continue;
+            }
+            let Some(taken) = pipeline_slot.take() else {
+                continue;
+            };
+            match tokio::task::spawn_blocking(move || process_and_generate(taken)).await {
+                Ok((returned, batches)) => {
+                    pipeline_slot = Some(returned);
+                    one_shot_runs += 1;
+                    info!("One-shot cycle {} completed", one_shot_runs);
 
-                            if dropped_while_generating > 0 {
-                                warn!("Dropped {} events while pipeline was generating", dropped_while_generating);
-                                dropped_while_generating = 0;
-                            }
-
-                            if !batches.is_empty() {
-                                let _ = upload_regression(
-                                    &sigma_repo,
-                                    batches,
-                                    &mut branch_pushed,
-                                    &push_branch,
-                                    &|| false,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("Generation task failed (panicked): {}", e);
-                            let _ = shutdown_tx.send(true);
-                            break;
-                        }
+                    if dropped_while_generating > 0 {
+                        warn!(
+                            "Dropped {} events while pipeline was generating",
+                            dropped_while_generating
+                        );
+                        dropped_while_generating = 0;
                     }
 
-                    if let Some(limit) = max_runs
-                        && one_shot_runs >= limit {
-                        info!("Reached max-runs limit ({}), shutting down", limit);
-                        let _ = shutdown_tx.send(true);
-                        break;
+                    if !batches.is_empty() {
+                        let _ = upload_regression(
+                            &sigma_repo,
+                            batches,
+                            &mut branch_pushed,
+                            &push_branch,
+                            &|| false,
+                        );
                     }
                 }
+                Err(e) => {
+                    error!("Generation task failed (panicked): {}", e);
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+            }
+
+            if let Some(limit) = max_runs
+                && one_shot_runs >= limit
+            {
+                info!("Reached max-runs limit ({}), shutting down", limit);
+                let _ = shutdown_tx.send(true);
+                break;
             }
         }
     }
